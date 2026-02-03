@@ -23,21 +23,68 @@ INFER_SECONDS = 1.00            # how much recent audio to classify each time
 INFER_EVERY_SECONDS = 0.50      # how often we run inference (sec)
 TOP_K = 8                       # how many YAMNet labels to inspect each inference
 
-MIN_CONFIDENCE = 0.30           # ignore weak predictions
-SMOOTHING_WINDOW = 8            # number of recent inference steps to vote over
-VOTES_REQUIRED = 3              # votes required within window to trigger event
-EVENT_COOLDOWN_SECONDS = 5.0    # suppress repeated triggers for same event
+MIN_CONFIDENCE = 0.40           # ignore weak predictions
+SMOOTHING_WINDOW = 10            # number of recent inference steps to vote over
+VOTES_REQUIRED = 4              # votes required within window to trigger event
+EVENT_COOLDOWN_SECONDS = 6.0    # suppress repeated triggers for same event
 
 
 # Map your human-friendly classes -> lists of YAMNet label keywords.
 # You will tune these after you test your actual sounds.
 EVENT_RULES: Dict[str, List[str]] = {
-    "Fire alarm / Siren": ["Siren", "Smoke detector", "Alarm", "Fire alarm"],
-    "Door knock": ["Knock", "Tap", "Thump", "Bang", "Wood"],
-    "Microwave / Timer beep": ["Microwave oven", "Beep", "Buzzer", "Alarm clock"],
-    "Doorbell": ["Doorbell", "Chime"],
-    "Phone ringtone": ["Ringtone", "Telephone bell ringing", "Telephone"],
-    "Dog bark": ["Bark", "Dog"],
+    # Fire alarms are often predicted as "Siren" or more general alarm-ish labels.
+    "Fire alarm": [
+        "Smoke detector",
+        "Siren",
+        "Alarm",
+        "Fire alarm",
+    ],
+
+    # YAMNet has explicit "Knock" and "Tap".
+    "Knock": [
+        "Knock",
+        "Tap",
+        "Bang",
+        "Thump",
+        "Slam",
+        # Optional: if your door is very squeaky / rattly this can sometimes show up
+        "Door",
+        "Sliding door",
+    ],
+
+    # YAMNet has an explicit "Microwave oven" label.
+    "Microwave beep": [
+        "Microwave oven",
+        "Beep",
+        "Buzzer",
+        "Alarm clock",
+        # Optional: sometimes timers/beeps get lumped into “Alarm”
+        "Alarm",
+    ],
+
+    # Ringtones are explicitly labeled.
+    "Phone ringtone": [
+        "Ringtone",
+        "Telephone bell ringing",
+        "Telephone",
+    ],
+
+    # Doorbell is explicit; chimes can overlap.
+    "Doorbell": [
+        "Doorbell",
+        "Chime",
+    ],
+
+    # “Water running” is usually picked up as faucet/sink/bathtub/toilet-related labels.
+    "Water running": [
+        "Water tap, faucet",
+        "Sink (filling or washing)",
+        "Bathtub (filling or washing)",
+        "Toilet flush",
+        # Optional: if your “water running” is more like shower sound,
+        # YAMNet sometimes hits other bathroom-related labels; keep these off unless you observe them.
+        # "Shower"
+    ],
 }
 
 
