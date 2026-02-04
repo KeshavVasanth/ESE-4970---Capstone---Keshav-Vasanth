@@ -1,15 +1,15 @@
 """
 mp_terminal.py
 
-A terminal-only, real-time audio “alert” prototype using MediaPipe Tasks AudioClassifier.
+A terminal-only, real-time audio alert program using MediaPipe Tasks AudioClassifier.
 
-WHAT THIS DOES
+WHAT IT DOES
 --------------
-1) Listens to your microphone continuously.
+1) Listens to the microphone continuously.
 2) Every INFER_EVERY_S seconds, it takes the most recent INFER_WINDOW_S seconds of audio.
 3) It feeds that audio into a pretrained audio classifier (YAMNet packaged for MediaPipe).
 4) The model outputs labels like “Doorbell”, “Ringtone”, “Water”, “Knock”, etc. with scores.
-5) We map those labels into YOUR six categories:
+5) We map those labels into our six categories:
       - Fire alarm
       - Knock
       - Microwave beep
@@ -23,8 +23,7 @@ WHAT THIS DOES
 
 HOW TO RUN
 ----------
-Activate your Python 3.11 venv (your .venv311):
-    source .venv311/bin/activate
+Activate Python 3.11 venv
 
 Then run:
     python mp_terminal.py
@@ -34,8 +33,7 @@ Stop:
 
 TROUBLESHOOTING
 ---------------
-- If you see mostly "(none)", you may need to grant microphone permission:
-  System Settings → Privacy & Security → Microphone → enable Terminal (or VS Code).
+Make sure to grant microphone permission
 """
 
 # ----------------------------
@@ -57,7 +55,7 @@ import sounddevice as sd  # Capturing audio from microphone
 # - python.BaseOptions: points to model file
 # - audio.AudioClassifier: classifier wrapper
 # - containers.AudioData: wraps raw waveform into format expected by classifier
-import mediapipe as mp  # noqa: F401 (import helps verify mediapipe is available)
+import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import audio
 from mediapipe.tasks.python.components import containers
@@ -67,7 +65,7 @@ from mediapipe.tasks.python.components import containers
 # 1) USER CONFIGURATION
 # =============================================================================
 
-# EVENT_RULES maps YOUR “events” to sets of keywords.
+# EVENT_RULES maps our “events” to sets of keywords.
 # The model produces labels (strings). We lowercase them and look for these keywords.
 #
 # Example:
@@ -84,38 +82,33 @@ EVENT_RULES: Dict[str, List[str]] = {
 
 # ---- Noise reduction / stability controls ----
 
-# Ignore any category score below MIN_SCORE.
-# Lower this if you're missing events; raise it if you get false triggers.
+# Ignores any category score below MIN_SCORE.
+# Lower this if we're missing events. Raise it if we get false triggers.
 MIN_SCORE = 0.25
 
 # How many recent inference results we remember for voting.
 # Larger = more stable but slower to trigger.
 VOTE_WINDOW = 10
 
-# How many times an event must appear within the last VOTE_WINDOW
-# before we “trigger” it.
+# How many times an event must appear within the last VOTE_WINDOW before we “trigger” it.
 VOTES_REQUIRED = 4
 
-# After triggering an event, we won’t trigger that SAME event again
-# until this many seconds have passed (prevents spamming).
+# After triggering an event, we won’t trigger that same event again until this many seconds have passed (prevents spamming).
 COOLDOWN_S = 6.0
 
 # ---- Audio capture settings ----
 
-# Sample rate for microphone capture.
-# 16 kHz is common for many audio models and is a safe default.
+# Sample rate for microphone capture. 16 kHz is common for many audio models.
 SR = 16000
 
 # Microphone callback chunk size.
-# Smaller = lower latency but more overhead; 0.25s is a good balance.
+# Smaller = lower latency but more overhead
 BLOCK_S = 0.25
 
 # How often we run classification.
-# For example, every 0.5 seconds.
 INFER_EVERY_S = 0.50
 
 # How much recent audio we classify each time.
-# For example, classify the last 1.0 seconds.
 INFER_WINDOW_S = 1.00
 
 # Number of top categories to print each inference for debugging.
@@ -139,13 +132,13 @@ def ensure_model_file() -> None:
     Ensure the MediaPipe-compatible model file exists locally.
 
     If it doesn't exist, we download it from MODEL_URL and save it as MODEL_FILE.
-    This prevents you from manually downloading the file.
+    This prevents us from manually downloading the file.
     """
-    # If the model is already present in the current folder, do nothing.
+    # If the model is already present in the current folder, we do nothing.
     if os.path.exists(MODEL_FILE):
         return
 
-    # Otherwise download it.
+    # Otherwise it's downloaded.
     print(f"Model '{MODEL_FILE}' not found. Downloading...")
     import urllib.request  # Standard library downloader
 
@@ -206,15 +199,14 @@ def extract_categories(result) -> List:
 
 def map_to_event(categories, min_score: float) -> Optional[Tuple[str, float]]:
     """
-    Convert model categories → your custom event label.
+    Convert model categories -> our custom event label.
 
     Strategy:
     - The model gives categories like:
          "Doorbell": 0.62
          "Chime": 0.40
          "Water": 0.55
-    - We lowercase the label and see if it contains any keyword
-      from EVENT_RULES[event].
+    - We lowercase the label and see if it contains any keyword from EVENT_RULES[event].
     - We keep the highest score matched for each event.
     - We return the best-scoring event overall.
 
@@ -244,7 +236,7 @@ def map_to_event(categories, min_score: float) -> Optional[Tuple[str, float]]:
                 continue  # ignore weak predictions
 
             for kw in keywords:
-                # Simple substring match (works well enough for a prototype)
+                # Simple substring match (works well enough for now)
                 if kw in label:
                     ev_best = max(ev_best, score)
 
@@ -317,7 +309,7 @@ def main() -> None:
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
 
     # Ring buffer stores the last ~10 seconds of audio.
-    # (We only classify ~1 second at a time, but keeping more is harmless.)
+    # (We only classify ~1 second at a time, but keeping more is harmless)
     ring = deque(maxlen=int(SR * 10))
 
     # Voting: store last VOTE_WINDOW best_event outputs
@@ -335,8 +327,8 @@ def main() -> None:
         Called by sounddevice in a separate audio thread whenever
         a new block of microphone samples is available.
 
-        IMPORTANT:
-        - Keep this function FAST.
+        Important:
+        - Keep this function fast.
         - Do not run ML here.
         - Just copy audio and push it into a queue for the main loop.
         """
@@ -404,7 +396,7 @@ def main() -> None:
                 # -------------------------------------------------
                 result = classifier.classify(audio_data)
 
-                # Extract categories robustly (fixes your “list has no attribute” issue)
+                # Extract categories robustly
                 categories = extract_categories(result)
 
                 # -------------------------------------------------
@@ -469,8 +461,8 @@ def main() -> None:
 # =============================================================================
 
 if __name__ == "__main__":
-    # This block runs when you execute: python mp_terminal.py
-    # We catch Ctrl+C cleanly so you don’t get an ugly stack trace.
+    # This block runs when we execute: python mp_terminal.py
+    # We catch Ctrl+C cleanly so we don’t get an ugly stack trace.
     try:
         main()
     except KeyboardInterrupt:
