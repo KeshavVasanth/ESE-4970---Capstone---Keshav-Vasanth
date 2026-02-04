@@ -1,347 +1,477 @@
-import time
-import queue
-from collections import deque
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+"""
+mp_terminal.py
 
-import numpy as np
-import pandas as pd
-import sounddevice as sd
-import scipy.signal
-import streamlit as st
-import tensorflow as tf
-import tensorflow_hub as hub
+A terminal-only, real-time audio “alert” prototype using MediaPipe Tasks AudioClassifier.
 
+WHAT THIS DOES
+--------------
+1) Listens to your microphone continuously.
+2) Every INFER_EVERY_S seconds, it takes the most recent INFER_WINDOW_S seconds of audio.
+3) It feeds that audio into a pretrained audio classifier (YAMNet packaged for MediaPipe).
+4) The model outputs labels like “Doorbell”, “Ringtone”, “Water”, “Knock”, etc. with scores.
+5) We map those labels into YOUR six categories:
+      - Fire alarm
+      - Knock
+      - Microwave beep
+      - Phone ringtone
+      - Doorbell
+      - Water running
+6) To reduce false triggers, we use:
+      - MIN_SCORE threshold (ignore low-confidence labels)
+      - Voting over a rolling window (VOTE_WINDOW)
+      - Cooldown to prevent spamming (COOLDOWN_S)
+
+HOW TO RUN
+----------
+Activate your Python 3.11 venv (your .venv311):
+    source .venv311/bin/activate
+
+Then run:
+    python mp_terminal.py
+
+Stop:
+    Ctrl + C
+
+TROUBLESHOOTING
+---------------
+- If you see mostly "(none)", you may need to grant microphone permission:
+  System Settings → Privacy & Security → Microphone → enable Terminal (or VS Code).
+"""
 
 # ----------------------------
-# Configuration
+# Standard library imports
 # ----------------------------
+import os                 # For checking if model file exists on disk
+import time               # For timestamps + timing inference intervals
+import queue              # Thread-safe queue for audio callback -> main loop
+from collections import deque  # Efficient fixed-length ring buffers / vote windows
+from typing import Dict, List, Optional, Tuple  # Type hints (for readability)
 
-TARGET_SR = 16000  # YAMNet expects 16 kHz mono waveform in [-1, 1]  :contentReference[oaicite:2]{index=2}
-BLOCK_SECONDS = 0.25            # audio callback chunk size (sec)
-INFER_SECONDS = 1.00            # how much recent audio to classify each time
-INFER_EVERY_SECONDS = 0.50      # how often we run inference (sec)
-TOP_K = 8                       # how many YAMNet labels to inspect each inference
+# ----------------------------
+# Third-party imports
+# ----------------------------
+import numpy as np        # Numerical arrays (audio waveform)
+import sounddevice as sd  # Capturing audio from microphone
 
-MIN_CONFIDENCE = 0.40           # ignore weak predictions
-SMOOTHING_WINDOW = 10            # number of recent inference steps to vote over
-VOTES_REQUIRED = 4              # votes required within window to trigger event
-EVENT_COOLDOWN_SECONDS = 6.0    # suppress repeated triggers for same event
+# MediaPipe Tasks (audio classifier)
+# - python.BaseOptions: points to model file
+# - audio.AudioClassifier: classifier wrapper
+# - containers.AudioData: wraps raw waveform into format expected by classifier
+import mediapipe as mp  # noqa: F401 (import helps verify mediapipe is available)
+from mediapipe.tasks import python
+from mediapipe.tasks.python import audio
+from mediapipe.tasks.python.components import containers
 
 
-# Map your human-friendly classes -> lists of YAMNet label keywords.
-# You will tune these after you test your actual sounds.
+# =============================================================================
+# 1) USER CONFIGURATION
+# =============================================================================
+
+# EVENT_RULES maps YOUR “events” to sets of keywords.
+# The model produces labels (strings). We lowercase them and look for these keywords.
+#
+# Example:
+#   Model label might be "Doorbell" or "Chime"
+#   If it contains "doorbell" or "chime", we count it as Doorbell.
 EVENT_RULES: Dict[str, List[str]] = {
-    # Fire alarms are often predicted as "Siren" or more general alarm-ish labels.
-    "Fire alarm": [
-        "Smoke detector",
-        "Siren",
-        "Alarm",
-        "Fire alarm",
-    ],
-
-    # YAMNet has explicit "Knock" and "Tap".
-    "Knock": [
-        "Knock",
-        "Tap",
-        "Bang",
-        "Thump",
-        "Slam",
-        # Optional: if your door is very squeaky / rattly this can sometimes show up
-        "Door",
-        "Sliding door",
-    ],
-
-    # YAMNet has an explicit "Microwave oven" label.
-    "Microwave beep": [
-        "Microwave oven",
-        "Beep",
-        "Buzzer",
-        "Alarm clock",
-        # Optional: sometimes timers/beeps get lumped into “Alarm”
-        "Alarm",
-    ],
-
-    # Ringtones are explicitly labeled.
-    "Phone ringtone": [
-        "Ringtone",
-        "Telephone bell ringing",
-        "Telephone",
-    ],
-
-    # Doorbell is explicit; chimes can overlap.
-    "Doorbell": [
-        "Doorbell",
-        "Chime",
-    ],
-
-    # “Water running” is usually picked up as faucet/sink/bathtub/toilet-related labels.
-    "Water running": [
-        "Water tap, faucet",
-        "Sink (filling or washing)",
-        "Bathtub (filling or washing)",
-        "Toilet flush",
-        # Optional: if your “water running” is more like shower sound,
-        # YAMNet sometimes hits other bathroom-related labels; keep these off unless you observe them.
-        # "Shower"
-    ],
+    "Fire alarm": ["siren", "alarm", "smoke", "fire"],
+    "Knock": ["knock", "tap", "bang", "thump"],
+    "Microwave beep": ["microwave", "beep", "buzzer", "timer"],
+    "Phone ringtone": ["ringtone", "telephone", "phone", "ringing"],
+    "Doorbell": ["doorbell", "chime"],
+    "Water running": ["water", "faucet", "sink", "bathtub", "toilet", "shower"],
 }
 
+# ---- Noise reduction / stability controls ----
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# Ignore any category score below MIN_SCORE.
+# Lower this if you're missing events; raise it if you get false triggers.
+MIN_SCORE = 0.25
 
-def resample_to_16k(x: np.ndarray, orig_sr: int) -> np.ndarray:
-    """Resample mono audio to 16kHz float32."""
-    if orig_sr == TARGET_SR:
-        return x.astype(np.float32, copy=False)
-    # scipy.signal.resample_poly is fast and good quality
-    gcd = np.gcd(orig_sr, TARGET_SR)
-    up = TARGET_SR // gcd
-    down = orig_sr // gcd
-    y = scipy.signal.resample_poly(x, up, down).astype(np.float32)
-    return y
+# How many recent inference results we remember for voting.
+# Larger = more stable but slower to trigger.
+VOTE_WINDOW = 10
+
+# How many times an event must appear within the last VOTE_WINDOW
+# before we “trigger” it.
+VOTES_REQUIRED = 4
+
+# After triggering an event, we won’t trigger that SAME event again
+# until this many seconds have passed (prevents spamming).
+COOLDOWN_S = 6.0
+
+# ---- Audio capture settings ----
+
+# Sample rate for microphone capture.
+# 16 kHz is common for many audio models and is a safe default.
+SR = 16000
+
+# Microphone callback chunk size.
+# Smaller = lower latency but more overhead; 0.25s is a good balance.
+BLOCK_S = 0.25
+
+# How often we run classification.
+# For example, every 0.5 seconds.
+INFER_EVERY_S = 0.50
+
+# How much recent audio we classify each time.
+# For example, classify the last 1.0 seconds.
+INFER_WINDOW_S = 1.00
+
+# Number of top categories to print each inference for debugging.
+# Increase to see more model labels.
+PRINT_TOP_K = 5
+
+# ---- Model file settings ----
+
+# MediaPipe AudioClassifier requires a .tflite file WITH MediaPipe metadata.
+# This model URL is a MediaPipe-packaged YAMNet.
+MODEL_FILE = "sound_classifier.tflite"
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/audio_classifier/yamnet/float32/latest/yamnet.tflite"
+
+
+# =============================================================================
+# 2) HELPER FUNCTIONS
+# =============================================================================
+
+def ensure_model_file() -> None:
+    """
+    Ensure the MediaPipe-compatible model file exists locally.
+
+    If it doesn't exist, we download it from MODEL_URL and save it as MODEL_FILE.
+    This prevents you from manually downloading the file.
+    """
+    # If the model is already present in the current folder, do nothing.
+    if os.path.exists(MODEL_FILE):
+        return
+
+    # Otherwise download it.
+    print(f"Model '{MODEL_FILE}' not found. Downloading...")
+    import urllib.request  # Standard library downloader
+
+    urllib.request.urlretrieve(MODEL_URL, MODEL_FILE)
+    print(f"Downloaded '{MODEL_FILE}' successfully.")
 
 
 def normalize_audio(x: np.ndarray) -> np.ndarray:
-    """Ensure float32 waveform in [-1, 1]. sounddevice usually gives float32 already."""
+    """
+    Convert audio to float32 and clamp values to [-1.0, 1.0].
+
+    Why:
+    - Many audio pipelines expect float32 waveforms.
+    - Clamping avoids weird out-of-range values.
+    """
     x = x.astype(np.float32, copy=False)
-    # If input is somehow outside range, clip safely
-    x = np.clip(x, -1.0, 1.0)
-    return x
+    return np.clip(x, -1.0, 1.0)
 
 
-def load_yamnet_and_labels() -> Tuple[hub.KerasLayer, List[str]]:
-    # TF Hub YAMNet tutorial shows loading from TF Hub. :contentReference[oaicite:3]{index=3}
-    model = hub.load("https://tfhub.dev/google/yamnet/1")
-
-    # Class map CSV is in the TF Models repo. :contentReference[oaicite:4]{index=4}
-    class_map_url = "https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv"
-    class_map = pd.read_csv(class_map_url)
-    class_names = class_map["display_name"].tolist()
-    return model, class_names
-
-
-def match_events_from_labels(
-    labels_with_scores: List[Tuple[str, float]],
-    rules: Dict[str, List[str]],
-    min_conf: float,
-) -> List[Tuple[str, float]]:
+def extract_categories(result) -> List:
     """
-    Given YAMNet (label, score) pairs, return matched high-level events (event, score).
-    """
-    matched = []
-    for event_name, keywords in rules.items():
-        best = 0.0
-        for label, score in labels_with_scores:
-            if score < min_conf:
-                continue
-            # Keyword match (simple, fast). You can improve this later.
-            for kw in keywords:
-                if kw.lower() in label.lower():
-                    best = max(best, float(score))
-        if best >= min_conf:
-            matched.append((event_name, best))
-    # Sort by score descending
-    matched.sort(key=lambda t: t[1], reverse=True)
-    return matched
+    Extract a list of "categories" (label+score objects) from MediaPipe output.
 
+    MediaPipe API version differences:
+    - Some versions return an AudioClassifierResult object:
+        result.classifications[0].categories
+    - Some versions return a list of AudioClassifierResult:
+        result[0].classifications[0].categories
 
-@dataclass
-class EventLogItem:
-    timestamp: float
-    event: str
-    score: float
+    This function makes the rest of the program independent of that difference.
 
-
-# ----------------------------
-# Streamlit UI
-# ----------------------------
-
-st.set_page_config(page_title="Audio Alert Prototype", layout="wide")
-st.title("Real-Time ML Audio Alerts (YAMNet Prototype)")
-
-with st.sidebar:
-    st.header("Controls")
-    input_device = st.number_input("Input device index (leave as 0 if unsure)", min_value=0, value=0, step=1)
-
-    st.subheader("Thresholds")
-    min_conf = st.slider("Min confidence", 0.05, 0.90, float(MIN_CONFIDENCE), 0.05)
-    votes_required = st.slider("Votes required", 1, 10, int(VOTES_REQUIRED), 1)
-    cooldown_s = st.slider("Cooldown (sec)", 0.0, 15.0, float(EVENT_COOLDOWN_SECONDS), 0.5)
-
-    st.subheader("Timing")
-    infer_every = st.slider("Inference every (sec)", 0.25, 2.0, float(INFER_EVERY_SECONDS), 0.05)
-    infer_window = st.slider("Inference window (sec)", 0.5, 3.0, float(INFER_SECONDS), 0.1)
-
-    st.subheader("Event rules (editable in code)")
-    st.caption("Edit EVENT_RULES in app.py to tune label matching.")
-
-
-status_placeholder = st.empty()
-col1, col2 = st.columns([1, 1])
-detected_box = col1.container()
-log_box = col2.container()
-
-detected_box.subheader("Current detection")
-current_event_text = detected_box.markdown("**Listening...**")
-current_topk_text = detected_box.text("")
-
-log_box.subheader("Event log")
-log_table_placeholder = log_box.empty()
-
-# Load model once
-@st.cache_resource
-def _cached_model():
-    return load_yamnet_and_labels()
-
-yamnet_model, class_names = _cached_model()
-
-# Audio ring buffer
-audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
-ring = deque(maxlen=int(TARGET_SR * 10))  # keep last ~10 seconds at 16 kHz
-
-# Smoothing votes
-recent_votes = deque(maxlen=int(SMOOTHING_WINDOW))
-last_trigger_time: Dict[str, float] = {}
-
-event_log: List[EventLogItem] = []
-
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        # Drop status into the queue for visibility (non-fatal)
-        pass
-    # indata: shape (frames, channels)
-    x = indata[:, 0]  # mono from first channel
-    audio_q.put(x.copy())
-
-def get_recent_audio(seconds: float) -> np.ndarray:
-    n = int(TARGET_SR * seconds)
-    if len(ring) < n:
-        # pad with zeros if we don't have enough yet
-        x = np.zeros(n, dtype=np.float32)
-        r = np.array(ring, dtype=np.float32)
-        x[-len(r):] = r
-        return x
-    else:
-        # take last n samples
-        return np.array(list(ring)[-n:], dtype=np.float32)
-
-def run_yamnet_on_waveform(wave_16k: np.ndarray):
-    """
     Returns:
-      scores: (num_frames, 521)
-      embeddings: (num_frames, 1024)
-      spectrogram: ...
+        A Python list of ClassificationCategory objects.
+        Each category typically has:
+          - category_name (string label)
+          - score (float confidence)
     """
-    # YAMNet accepts 1-D float32 waveform at 16 kHz. :contentReference[oaicite:5]{index=5}
-    wave_16k = normalize_audio(wave_16k)
-    scores, embeddings, spectrogram = yamnet_model(wave_16k)
-    return scores.numpy()
+    # If MediaPipe returned a list, take the first result item.
+    if isinstance(result, list):
+        result_obj = result[0] if len(result) > 0 else None
+    else:
+        result_obj = result
 
-def topk_labels(scores: np.ndarray, k: int) -> List[Tuple[str, float]]:
-    # scores is (time_frames, 521). Average across time for the clip. :contentReference[oaicite:6]{index=6}
-    mean_scores = scores.mean(axis=0)
-    top_idx = np.argsort(mean_scores)[::-1][:k]
-    return [(class_names[i], float(mean_scores[i])) for i in top_idx]
+    # If nothing is there, no categories.
+    if result_obj is None:
+        return []
 
-# Start audio stream
-try:
-    stream = sd.InputStream(
-        device=int(input_device),
-        channels=1,
-        samplerate=TARGET_SR,  # easiest: capture directly at 16k
-        blocksize=int(TARGET_SR * BLOCK_SECONDS),
-        callback=audio_callback
+    # Typical structure: result_obj.classifications is a list of "heads"
+    # and each head has .categories.
+    if hasattr(result_obj, "classifications") and result_obj.classifications:
+        head = result_obj.classifications[0]  # take the first head
+        if hasattr(head, "categories") and head.categories:
+            return list(head.categories)
+
+    # If we can't find the expected attributes, return empty.
+    return []
+
+
+def map_to_event(categories, min_score: float) -> Optional[Tuple[str, float]]:
+    """
+    Convert model categories → your custom event label.
+
+    Strategy:
+    - The model gives categories like:
+         "Doorbell": 0.62
+         "Chime": 0.40
+         "Water": 0.55
+    - We lowercase the label and see if it contains any keyword
+      from EVENT_RULES[event].
+    - We keep the highest score matched for each event.
+    - We return the best-scoring event overall.
+
+    Args:
+        categories: list of ClassificationCategory objects
+        min_score: ignore categories below this confidence
+
+    Returns:
+        (event_name, best_score) if something matched, else None
+    """
+    # Convert categories into a simple list of (label_lowercase, score_float)
+    label_scores: List[Tuple[str, float]] = []
+    for c in categories:
+        name = getattr(c, "category_name", "")
+        score = float(getattr(c, "score", 0.0))
+        label_scores.append((name.lower(), score))
+
+    best_event: Optional[str] = None
+    best_score: float = 0.0
+
+    # For each event, check if any of its keywords appear in any label.
+    for event, keywords in EVENT_RULES.items():
+        ev_best = 0.0  # best score found for THIS event
+
+        for label, score in label_scores:
+            if score < min_score:
+                continue  # ignore weak predictions
+
+            for kw in keywords:
+                # Simple substring match (works well enough for a prototype)
+                if kw in label:
+                    ev_best = max(ev_best, score)
+
+        # If this event is the strongest so far, remember it.
+        if ev_best > best_score:
+            best_score = ev_best
+            best_event = event
+
+    # If no event matched any keywords, return None.
+    if best_event is None:
+        return None
+
+    return best_event, best_score
+
+
+def top_k_string(categories, k: int) -> str:
+    """
+    Convert top-k categories into a readable one-line string for printing.
+
+    Example output:
+        "Doorbell:0.62 | Chime:0.40 | Ringtone:0.10 | ..."
+
+    Args:
+        categories: list of ClassificationCategory objects
+        k: how many to show
+    """
+    out = []
+    for c in categories[:k]:
+        out.append(f"{c.category_name}:{c.score:.2f}")
+    return " | ".join(out)
+
+
+# =============================================================================
+# 3) MAIN LOOP
+# =============================================================================
+
+def main() -> None:
+    """
+    Main application logic.
+
+    Steps:
+    1) Ensure the model file exists locally.
+    2) Construct MediaPipe AudioClassifier.
+    3) Start microphone stream using sounddevice.
+    4) Continuously buffer microphone audio into a ring buffer.
+    5) Periodically run inference on the latest audio window.
+    6) Print top labels + trigger events using voting/cooldown.
+    """
+    # Make sure we have the correct model file on disk.
+    ensure_model_file()
+
+    # Create the MediaPipe classifier.
+    # base_options points to the .tflite file (with metadata).
+    base_options = python.BaseOptions(model_asset_path=MODEL_FILE)
+
+    # options: how many results (labels) we want back each inference
+    options = audio.AudioClassifierOptions(
+        base_options=base_options,
+        max_results=PRINT_TOP_K
     )
-    stream.start()
-    status_placeholder.success("Microphone stream started.")
-except Exception as e:
-    status_placeholder.error(f"Failed to start mic stream: {e}")
-    st.stop()
 
-# Main loop
-last_infer = 0.0
+    # Build classifier object from options
+    classifier = audio.AudioClassifier.create_from_options(options)
 
-# We use Streamlit's "while True" pattern with st.empty updates.
-# Stop button
-stop = st.button("Stop")
+    # ----------------------------
+    # Audio buffering objects
+    # ----------------------------
 
-while not stop:
-    # Pull any new audio chunks into ring buffer
-    try:
+    # Audio callback will push short chunks here.
+    audio_q: "queue.Queue[np.ndarray]" = queue.Queue()
+
+    # Ring buffer stores the last ~10 seconds of audio.
+    # (We only classify ~1 second at a time, but keeping more is harmless.)
+    ring = deque(maxlen=int(SR * 10))
+
+    # Voting: store last VOTE_WINDOW best_event outputs
+    recent_votes: deque[Optional[str]] = deque(maxlen=VOTE_WINDOW)
+
+    # Cooldown tracking: last time we triggered each event type
+    last_trigger_time: Dict[str, float] = {}
+
+    # ----------------------------
+    # Microphone callback
+    # ----------------------------
+
+    def callback(indata, frames, time_info, status):
+        """
+        Called by sounddevice in a separate audio thread whenever
+        a new block of microphone samples is available.
+
+        IMPORTANT:
+        - Keep this function FAST.
+        - Do not run ML here.
+        - Just copy audio and push it into a queue for the main loop.
+        """
+        # indata shape: (frames, channels). We use mono: channel 0.
+        audio_q.put(indata[:, 0].copy())
+
+    print("\nStarting mic... (Ctrl+C to stop)\n")
+
+    # Open a microphone stream. When inside this 'with' block:
+    # - sounddevice continuously calls callback(...)
+    # - we do processing in the while loop below
+    with sd.InputStream(
+        channels=1,                         # mono
+        samplerate=SR,                      # sample rate
+        blocksize=int(SR * BLOCK_S),        # frames per callback
+        callback=callback                   # function called on each block
+    ):
+        last_infer = 0.0  # tracks the last time we ran inference
+
+        # Infinite loop: keep running until user stops (Ctrl+C)
         while True:
-            chunk = audio_q.get_nowait()
-            ring.extend(chunk.tolist())
-    except queue.Empty:
-        pass
+            # -----------------------------------------------------
+            # 1) Move any queued audio chunks into the ring buffer
+            # -----------------------------------------------------
+            try:
+                while True:
+                    # Get next chunk without blocking. If empty, queue.Empty is thrown.
+                    chunk = audio_q.get_nowait()
 
-    now = time.time()
-    if now - last_infer >= infer_every and len(ring) > int(TARGET_SR * 0.5):
-        last_infer = now
+                    # Append chunk samples into ring buffer (as Python floats)
+                    ring.extend(chunk.tolist())
+            except queue.Empty:
+                # No more queued chunks right now.
+                pass
 
-        wave = get_recent_audio(infer_window)
-        scores = run_yamnet_on_waveform(wave)
-        top = topk_labels(scores, TOP_K)
+            now = time.time()
 
-        # Display top-k (debugging / tuning)
-        current_topk_text.text("\n".join([f"{lbl:35s}  {sc:0.3f}" for lbl, sc in top]))
+            # -----------------------------------------------------
+            # 2) Time to run inference?
+            # -----------------------------------------------------
+            # Only run classifier if enough time has passed AND we have enough audio buffered.
+            if now - last_infer >= INFER_EVERY_S and len(ring) > int(SR * 0.5):
+                last_infer = now
 
-        # Map to your events
-        matched_events = match_events_from_labels(top, EVENT_RULES, min_conf)
+                # -------------------------------------------------
+                # 3) Prepare the input audio window for the model
+                # -------------------------------------------------
+                # Extract the last INFER_WINDOW_S seconds from ring buffer.
+                n = int(SR * INFER_WINDOW_S)
 
-        # Vote for the best matched event (or None)
-        best_event: Optional[str] = matched_events[0][0] if matched_events else None
-        recent_votes.append(best_event)
+                # Convert ring buffer to numpy array (last n samples)
+                wave = np.array(list(ring)[-n:], dtype=np.float32)
 
-        # Determine if any event has enough votes
-        vote_counts: Dict[str, int] = {}
-        for v in recent_votes:
-            if v is None:
-                continue
-            vote_counts[v] = vote_counts.get(v, 0) + 1
+                # Normalize/clamp
+                wave = normalize_audio(wave)
 
-        triggered = None
-        triggered_score = 0.0
-        for ev, cnt in vote_counts.items():
-            if cnt >= votes_required:
-                # find score from matched list (if present this frame)
-                score_now = 0.0
-                for me, sc in matched_events:
-                    if me == ev:
-                        score_now = sc
-                # cooldown check
-                last_t = last_trigger_time.get(ev, 0.0)
-                if now - last_t >= cooldown_s:
-                    triggered = ev
-                    triggered_score = score_now
-                    break
+                # Wrap it as MediaPipe AudioData
+                audio_data = containers.AudioData.create_from_array(
+                    wave,
+                    sample_rate=SR
+                )
 
-        if triggered:
-            last_trigger_time[triggered] = now
-            event_log.insert(0, EventLogItem(timestamp=now, event=triggered, score=triggered_score))
-            current_event_text.markdown(f"## ✅ **{triggered}**  \nConfidence: `{triggered_score:0.2f}`")
-        else:
-            if best_event:
-                current_event_text.markdown(f"**Listening…** likely: `{best_event}`")
-            else:
-                current_event_text.markdown("**Listening…**")
+                # -------------------------------------------------
+                # 4) Run the audio classifier
+                # -------------------------------------------------
+                result = classifier.classify(audio_data)
 
-        # Update log table
-        if event_log:
-            df = pd.DataFrame([{
-                "Time": time.strftime("%H:%M:%S", time.localtime(it.timestamp)),
-                "Event": it.event,
-                "Score": round(it.score, 2)
-            } for it in event_log[:25]])
-            log_table_placeholder.dataframe(df, use_container_width=True)
-        else:
-            log_table_placeholder.info("No events logged yet.")
+                # Extract categories robustly (fixes your “list has no attribute” issue)
+                categories = extract_categories(result)
 
-    time.sleep(0.02)
+                # -------------------------------------------------
+                # 5) Print top-K labels for debugging
+                # -------------------------------------------------
+                timestamp = time.strftime("%H:%M:%S")
+                if categories:
+                    debug_line = top_k_string(categories, PRINT_TOP_K)
+                    print(f"[{timestamp}] top-k: {debug_line}")
+                else:
+                    print(f"[{timestamp}] top-k: (none)")
 
-# Cleanup
-stream.stop()
-stream.close()
-st.write("Stopped.")
+                # -------------------------------------------------
+                # 6) Map model labels to YOUR event names
+                # -------------------------------------------------
+                mapped = map_to_event(categories, MIN_SCORE)
+
+                # Best event name (or None if nothing matched)
+                best_event = mapped[0] if mapped else None
+
+                # Score for the best event (0 if none)
+                best_score = mapped[1] if mapped else 0.0
+
+                # -------------------------------------------------
+                # 7) Vote smoothing (reduce flicker / false triggers)
+                # -------------------------------------------------
+                recent_votes.append(best_event)
+
+                # Count how many times each event appeared in the vote window
+                vote_counts: Dict[str, int] = {}
+                for v in recent_votes:
+                    if v is None:
+                        continue
+                    vote_counts[v] = vote_counts.get(v, 0) + 1
+
+                # -------------------------------------------------
+                # 8) Decide whether to trigger an event
+                # -------------------------------------------------
+                triggered = None
+                for ev, cnt in vote_counts.items():
+                    # Need enough votes
+                    if cnt >= VOTES_REQUIRED:
+                        # Also respect cooldown
+                        last_t = last_trigger_time.get(ev, 0.0)
+                        if now - last_t >= COOLDOWN_S:
+                            triggered = ev
+                            break
+
+                # If triggered, log it and print a big message
+                if triggered:
+                    last_trigger_time[triggered] = now
+                    print(f"   ✅ EVENT: {triggered} (score ~ {best_score:.2f})\n")
+
+            # -----------------------------------------------------
+            # 9) Sleep a tiny amount to reduce CPU usage
+            # -----------------------------------------------------
+            time.sleep(0.02)
+
+
+# =============================================================================
+# 4) ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+    # This block runs when you execute: python mp_terminal.py
+    # We catch Ctrl+C cleanly so you don’t get an ugly stack trace.
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped.")
